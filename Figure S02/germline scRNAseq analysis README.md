@@ -1,1 +1,1 @@
-Scripts for germline scRNAseq in /Figure 1/
+Scripts for germline scRNAseq in /Figure_01/
