@@ -1,0 +1,186 @@
+message("++++++++++++++++++++++++++++++++++++++++")
+message("++++++++++ CHECK IN GALACTOSE ++++++++++")
+message("++++++++++++++++++++++++++++++++++++++++")
+
+
+library(data.table)
+library(biomaRt)
+library(magrittr)
+library(ggplot2)
+library(ComplexHeatmap)
+library("KEGGREST")
+library(viridis)
+library(RColorBrewer)
+library("DESeq2")
+
+
+Project <- "mmMEFs_galactoseOnly_"
+BASE_DIR <- “/…/MBU_Stephen_MEFs_bulk/"
+RESULTS_FIGURES <- “/…/MBU_Stephen_MEFs_bulk/results/figures/mitophagy_michele/"
+
+
+message("++++++++++ prepare metadata information ++++++++++")
+
+metadata <- read.csv(paste(BASE_DIR, "data/metadata/MBU_Stephen_MEFs_bulk_sampleSheet.csv", sep = ""), sep = "\t")
+metadata$culture.media <- vapply(strsplit(metadata$Details," "), `[`, 3, FUN.VALUE=character(1))
+metadata$culture.media <- ifelse(metadata$culture.media == "High", "High Glucose", ifelse(metadata$culture.media == "Low", "Low Glucose", "Galactose"))
+metadata$Heteroplasmy <- as.numeric(as.character(gsub( "%", "", metadata$Heteroplasmy)))
+metadata$Heteroplasmy_group <- ifelse(metadata$Heteroplasmy > 50, "highHeteroplasmy", "lowHeteroplasmy") # as Malwina did
+metadata$CM.heteroplasmy <- paste(metadata$culture.media, metadata$Heteroplasmy_group, sep = "_")
+metadata$clone <- sub(".$", "", metadata$Name)
+
+
+message("++++++++++ prepare count matrix ++++++++++")
+ensembl    =  useEnsembl(biomart="ensembl", dataset="mmusculus_gene_ensembl")
+ensEMBL2id <- getBM(attributes=c('ensembl_gene_id', 'external_gene_name'), mart = ensembl)
+
+
+# list of STAR output files
+files <- list.files(paste0(BASE_DIR, "data/STAR"), "*ReadsPerGene.out.tab$", full.names = T)
+files <- files[!grepl("lostreads", files)]
+# get file names
+names(files) <- mgsub::mgsub(files, c(".*SLX-22336\\."), c(""))
+names(files) <- mgsub::mgsub(names(files), c("\\.HGNFHDRX2."), c("_"))
+names(files) <- mgsub::mgsub(names(files), c("\\ReadsPerGene.out.tab"), c(""))
+
+files_s1 <- files[grepl("s_1", files)]
+files_s2 <- files[grepl("s_2", files)]
+
+# loop over STAR output files: get column 4 (C1 is geneID, C2 is for unstranded data, c3 has very low counts (even if it counts for the 1st read strand), c4  counts for the 2nd read strand aligned with RNA.
+#                              C2 and c4 have very similar counts. c3 has very low.
+count_matrix_creation <- function(files, column, file) {
+
+        # create count matrix from list of STAR output files
+        # files: list of files (full path)
+        # column: whether 1 or 3 (depending on strandedness of file
+
+        countData = data.frame(fread(files[1]))[c(1,column)]
+
+        for(i in 2:length(files)) {
+          incoming = data.frame(fread(files[i]))[c(1,column)]
+          genes = countData$V1[countData$V1 %in% incoming$V1]
+          countData = countData[countData$V1 %in% genes ,]
+          incoming = incoming[incoming$V1 %in% genes , ]
+          countData = merge(countData, incoming, by="V1")
+        }
+
+        return(countData)
+
+}
+
+cm_s1 <- count_matrix_creation(files = files_s1, column = 4)
+names(cm_s1) <- c("ENS_geneID", names(files_s1))
+cm_s2 <- count_matrix_creation(files = files_s2, column = 4)
+names(cm_s2) <- c("ENS_geneID", names(files_s2))
+
+countData <- merge(cm_s1, cm_s2, by = "ENS_geneID")
+rm(cm_s1)
+rm(cm_s2)
+
+# convert to gene symbol
+countData <- countData[grepl("ENSMUSG", countData$ENS_geneID) ,] # remove the 4 nUnmapped... STAR rows
+countData <- merge(countData, ensEMBL2id, by.x="ENS_geneID", by.y="ensembl_gene_id")  # convert to gene symbol
+rownames(countData) <- ifelse(duplicated(countData$external_gene_name), countData$ENS_geneID, countData$external_gene_name) # about 500 genes have duplicated gene symbols (maybe ENS differentiates between spliced varians, genes symbol no).In these cases, keep ENS gene ID
+countData <- subset(countData, select = -c(ENS_geneID, external_gene_name))
+countData <- countData[rowSums(countData) > 1,] # 56941 - 28137 = 28804
+
+# STRNADEDNESS
+samples <- unique(sapply(strsplit(colnames(countData),"_"), `[`, 1))
+count.df <- data.frame(matrix(nrow = dim(countData)[1], ncol = length(samples)))
+colnames(count.df) <- samples
+rownames(count.df) <- rownames(countData)
+
+for (sample in samples) {
+        count.df[[sample]] <- rowSums(countData[,grep(pattern = sample, x = colnames(countData), value = T)])
+}
+message("+++++++++ removal of outlier samples ++++++++++")
+
+toRemove <- c("B11", "C11", "D11", "D7",  "E7",  "F7")
+count.df <- dplyr::select(count.df, -toRemove)
+metadata <- metadata[! metadata$Barcode %in% toRemove , ]
+
+
+
+message("++++++++++ removal of glucose samples ++++++++++")
+
+toRemove <- metadata[metadata$culture.media != "Galactose" ,]$Barcode
+count.df <- dplyr::select(count.df, -toRemove)
+metadata <- metadata[! metadata$Barcode %in% toRemove , ]
+
+
+
+
+
+message("++++++++++ preprocessing ++++++++++")
+dds = DESeqDataSetFromMatrix(countData = count.df, colData = metadata, design = ~ Heteroplasmy_group )
+dds <- collapseReplicates(dds, groupby = metadata$Barcode)
+dds = DESeq(dds, minReplicatesForReplace=5)
+
+cbind(resultsNames(dds))
+
+res <- results(dds, alpha = 0.05)
+head(res)
+summary(res)
+
+rld = rlog(dds)
+vsd = vst(dds)
+rld_df <- as.data.frame(assay(rld))
+
+res = na.omit(res)
+res.signif = res[res$padj < 0.05 ,]
+
+
+library(readxl)
+res.signif.gal <- as.data.frame(read_excel(paste(BASE_DIR, "data_from_Malwina/MBU_spb54_006_highHet_vs_lowHet__resSig_Galactose_padj0.05.xlsx", sep=''), range = "A1:I2360"))
+rownames(res.signif.gal) <- res.signif.gal[,1]
+res.signif.gal <- res.signif.gal[ , -1]
+
+
+
+message("++++++++++ look at the pathways of interest ++++++++++")
+
+
+heatmap_plot <- function(kegg_pathway, save_string) {
+        df <- data.frame(genes=keggGet(kegg_pathway)[[1]]$GENE)
+        df %>% filter(row_number() %% 2 == 0) -> df ## Select even rows
+        genes <- gsub( ";.*", "", df$genes)
+        genes <- unique(genes)
+
+        rld_df_meanCentered <- rld_df - rowMeans(rld_df)
+
+        selected_genes <- intersect(genes, res.signif.gal$external_gene_name)
+        mat <- rld_df_meanCentered[rownames(rld_df_meanCentered) %in% ensEMBL2id[ ensEMBL2id$external_gene_name %in% selected_genes,]$external_gene_name ,]
+
+        sampleTable_coll <- metadata[order(metadata$Heteroplasmy),]
+        mat2 <- mat[, match(sampleTable_coll$Barcode, colnames(mat))]
+
+        ht_anno <- data.frame(sample= colnames(mat2))
+        ht_anno$Heteroplasmy <- sampleTable_coll[match(ht_anno$sample, sampleTable_coll$Barcode),]$Heteroplasmy
+        ht_anno <- ht_anno[order(ht_anno$Heteroplasmy),]
+        ht_anno$heteroplasmyBin <- ifelse(ht_anno$Heteroplasmy>50, "highHeteroplasmy", "lowHeteroplasmy")
+        ht_anno$heteroplasmyBin <- factor(ht_anno$heteroplasmyBin, levels = c("lowHeteroplasmy", "highHeteroplasmy"))
+
+        ha_top = HeatmapAnnotation(Heteroplasmy=anno_points(ht_anno$Heteroplasmy, pch = 16, size = unit(2, "mm")),  show_annotation_name = TRUE)
+        ha_bottom = HeatmapAnnotation(Group = ht_anno$heteroplasmyBin, col = list(Group = group_cols),  show_annotation_name = TRUE)
+
+        mat2 <- mat2[,match( ht_anno$sample, colnames(mat2))]
+
+        col_SIG_pseudo <- ifelse( rownames(mat2) %in%  res.signif.gal$external_gene_name, "green4", "black")
+
+        ht1 = Heatmap(as.matrix(mat2),  name = "Bulk RNA-seq: galactose",  row_title = "", column_title = paste(save_string, " genes"),
+              show_row_names = TRUE, cluster_columns = FALSE, cluster_rows = TRUE ,
+              heatmap_legend_param = list(title = "Expression in MEFs", legend_height = unit(3, "cm"), title_position = "topleft"),
+              row_names_side ="right", column_split = ht_anno$heteroplasmyBin,
+              top_annotation = ha_top, bottom_annotation = ha_bottom, show_column_dend = TRUE,
+              row_names_gp = gpar(fontface = "italic", col = col_SIG_pseudo))
+        pdf(paste(RESULTS_FIGURES, save_string, "_KEGGgenes_galactose_heatmap.pdf", sep = ""), width = 8)
+        par(bg=NA)
+        draw(ht1, ht_gap = unit(1.5, "cm"), heatmap_legend_side = "right", annotation_legend_side = "right")
+        dev.off()
+}
+
+heatmap_plot(kegg_pathway = "mmu04137", save_string = "Mitophagy")
+heatmap_plot(kegg_pathway = "mmu04140", save_string = "Autophagy")
+heatmap_plot(kegg_pathway = "mmu04120", save_string = "Ubiquitin_mediated_proteolysis")
+heatmap_plot(kegg_pathway = "mmu03050", save_string = "Proteasome")
+
